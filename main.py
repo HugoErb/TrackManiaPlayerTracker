@@ -17,77 +17,6 @@ def _extract_int(text: str, default=None):
     m = re.search(r"\d+", text.replace("\u202f","").replace("\xa0",""))
     return int(m.group(0)) if m else default
 
-def fetch_online_records(maps):
-    """
-    maps: liste de tuples (name, href)
-    Règles:
-      - records >  MAX_RECORDS -> append nom dans forbidden_file
-      - records <  MIN_RECORDS -> ignore
-      - MIN_RECORDS <= records <= MAX_RECORDS -> print("OK") + retourne en éligibles
-    Retourne: [(name, href, records), ...] pour les maps éligibles
-    """
-    eligible = []
-
-    # 1) Charger les interdits existants pour ne pas dupliquer
-    path = Path(FORBIDDEN_MAP_FILE_NAME)
-    existing_forbidden = set()
-    if path.exists():
-        with path.open("r", encoding="utf-8") as f:
-            existing_forbidden = {
-                line.strip().casefold()
-                for line in f
-                if line.strip()
-            }
-
-    # 2) Ouvrir en append (ne réinitialise pas le fichier)
-    with path.open("a", encoding="utf-8") as forb:
-        for idx, (name, href) in enumerate(
-                tqdm(maps, total=len(maps), desc="Lecture des Online records", unit="map"),
-                start=1
-        ):
-            try:
-                page.goto(href, wait_until="load")
-                page.wait_for_load_state("networkidle")
-            except PlaywrightTimeoutError:
-                continue
-
-            # Lire le nombre d'Online records
-            records = None
-            try:
-                btn = page.locator("button[role='button'][data-bs-toggle='tab'][data-bs-target='#onlinerecs']").first
-                if btn.count() > 0:
-                    sp = btn.locator("span[template='FormatCountShort']").first
-                    if sp.count() > 0:
-                        records = _extract_int(sp.inner_text())
-                    if records is None:
-                        records = _extract_int(btn.inner_text())
-                if records is None:
-                    btn2 = page.get_by_role("button", name=re.compile(r"Online records", re.I)).first
-                    if btn2.count() > 0:
-                        records = _extract_int(btn2.inner_text())
-            except Exception:
-                pass
-
-            if records is None:
-                continue
-
-                # > MAX_RECORDS -> ajouter SANS doublon
-            if records > MAX_RECORDS:
-                key = name.strip().casefold()
-                if key not in existing_forbidden:
-                    forb.write(f"{name}\n")  # append seulement si absent
-                    existing_forbidden.add(key)
-                continue
-
-                # < MIN_RECORDS -> ignorer
-            if records < MIN_RECORDS:
-                continue
-
-                # Entre les bornes -> OK
-            eligible.append((name, href, records))
-
-    return eligible
-
 def get_maps(url: str):
     items = []
     seen_links = set()
@@ -195,13 +124,153 @@ def get_periode_quatre_mois():
     il_y_a_4_mois = aujourd_hui - relativedelta(months=INTERVAL_MONTH_NUMBER)
     return f"{il_y_a_4_mois:%Y-%m-%d}...{aujourd_hui:%Y-%m-%d}"
 
+def find_player_on_tmio(page, tmio_url: str, player_name: str, max_load_more: int = 50) -> bool:
+    """
+    Ouvre le leaderboard trackmania.io, clique 'Load more...' (avec tqdm),
+    puis scanne la liste des joueurs (avec tqdm) pour trouver player_name.
+    Retourne True si trouvé.
+    """
+    rows_sel = "table.table.is-fullwidth.is-striped tbody tr"
+
+    # Aller sur l'URL (SPA avec #)
+    page.goto(tmio_url, wait_until="load")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_selector(rows_sel, timeout=30000)
+
+    # --- tqdm: chargement du leaderboard (Load more...)
+    prev = page.locator(rows_sel).count()
+    t_load = tqdm(total=0, desc="Load leaderboard", unit="rows", leave=False)
+    for _ in range(max_load_more):
+        btn = page.locator("button:has-text('Load more')").first
+        if btn.count() == 0 or not btn.is_enabled():
+            break
+        rows_before = prev
+        btn.click()
+        page.wait_for_load_state("networkidle")
+        try:
+            page.wait_for_function(
+                """
+                (prev) => document.querySelectorAll('table.table.is-fullwidth.is-striped tbody tr').length > prev
+                """,
+                arg=rows_before,
+                timeout=15000
+            )
+        except Exception:
+            break
+        prev = page.locator(rows_sel).count()
+        t_load.update(max(0, prev - rows_before))
+    t_load.close()
+
+    # --- tqdm: scan des joueurs
+    cells = page.locator(f"{rows_sel} td:nth-child(2)")
+    n = cells.count()
+    target = player_name.strip().casefold()
+    t_scan = tqdm(total=n, desc="Scan joueurs", unit="joueur", leave=False)
+    for i in range(n):
+        try:
+            txt = cells.nth(i).inner_text().strip()
+            norm = " ".join(txt.split()).casefold()
+            if target in norm:
+                t_scan.update(n - t_scan.n)
+                t_scan.close()
+                return True
+        except Exception:
+            pass
+        t_scan.update(1)
+    t_scan.close()
+    return False
+
+def fetch_online_records(maps):
+    """
+    Pour chaque map:
+      - lit Online records sur TMX
+      - si > MAX_RECORDS -> ajoute le nom dans forbidden (sans doublon)
+      - si < MIN_RECORDS -> ignore
+      - sinon -> récupère le lien 'View more on trackmania.io', ouvre, charge tout, cherche TRACKED_PLAYER
+    Retourne: [(name, href_tmx, records, href_tmio, found_bool), ...]
+    """
+    eligible = []
+
+    # Interdits existants (pour ne pas dupliquer)
+    path = Path(FORBIDDEN_MAP_FILE_NAME)
+    existing_forbidden = set()
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            existing_forbidden = {line.strip().casefold() for line in f if line.strip()}
+
+    with path.open("a", encoding="utf-8") as forb:
+        for idx, (name, href) in enumerate(
+            tqdm(maps, total=len(maps), desc="Lecture des Online records", unit="map"),
+            start=1
+        ):
+            try:
+                page.goto(href, wait_until="load")
+                page.wait_for_load_state("networkidle")
+            except PlaywrightTimeoutError:
+                continue
+
+            # Online records
+            records = None
+            try:
+                btn = page.locator("button[role='button'][data-bs-toggle='tab'][data-bs-target='#onlinerecs']").first
+                if btn.count() > 0:
+                    sp = btn.locator("span[template='FormatCountShort']").first
+                    if sp.count() > 0:
+                        records = _extract_int(sp.inner_text())
+                    if records is None:
+                        records = _extract_int(btn.inner_text())
+                if records is None:
+                    btn2 = page.get_by_role("button", name=re.compile(r"Online records", re.I)).first
+                    if btn2.count() > 0:
+                        records = _extract_int(btn2.inner_text())
+            except Exception:
+                pass
+
+            if records is None:
+                continue
+
+            # > MAX_RECORDS -> mettre dans forbidden (sans doublon)
+            if records > MAX_RECORDS:
+                key = name.strip().casefold()
+                if key not in existing_forbidden:
+                    forb.write(f"{name}\n")
+                    existing_forbidden.add(key)
+                continue
+
+            # < MIN_RECORDS -> ignorer
+            if records < MIN_RECORDS:
+                continue
+
+            # Éligible : récupérer le lien trackmania.io
+            tmio_url = None
+            try:
+                link = page.locator("a.btn.btn-link[href*='trackmania.io/#/leaderboard/']").first
+                if link.count() == 0:
+                    link = page.locator("a.btn.btn-link:has-text('View more on trackmania.io')").first
+                if link.count() > 0:
+                    tmio_url = link.get_attribute("href")
+            except Exception:
+                tmio_url = None
+
+            found = False
+            if tmio_url:
+                try:
+                    found = find_player_on_tmio(page, tmio_url, TRACKED_PLAYER, max_load_more=50)
+                except Exception:
+                    found = False
+
+            eligible.append((name, href, records, tmio_url or "", found))
+
+    return eligible
+
+
 
 if __name__ == '__main__':
 
     # Init
     start_time = time.time()
     date_interval = get_periode_quatre_mois()
-    output_file = SEEKED_PLAYER + "_" + date_interval + ".txt"
+    output_file = "reports/" + TRACKED_PLAYER + "_" + date_interval + ".txt"
     url = MAP_LIST_URL + date_interval
 
     with sync_playwright() as p:
@@ -213,14 +282,21 @@ if __name__ == '__main__':
         all_maps = get_maps(url)
         print(f"\n{len(all_maps)} maps trouvées en {time.time() - start_time:.2f} sec.")
         all_maps = filter_maps_with_forbidden(all_maps)
-        print(f"Filtrage des maps effectuées, {len(all_maps)} restante(s).\n")
+        # all_maps = all_maps[:10]
+        print(f"Filtrage des maps effectué, {len(all_maps)} restante(s).\n")
 
         eligible_maps = fetch_online_records(all_maps)
-        for name, href, records in eligible_maps:
-            print(f"- {records} — {name} -> {href}")
         print(f"\n{len(eligible_maps)} maps éligibles trouvées en {time.time() - start_time:.2f} sec.")
 
-        print(f"\nRecherche de {SEEKED_PLAYER} dans les maps récupérées en cours...")
+        print(f"\nRecherche de {TRACKED_PLAYER} dans les maps récupérées en cours...")
+        hits = [e for e in eligible_maps if e[-1] is True]
+        with open(output_file, "a", encoding="utf-8") as rep:
+            for name, href_tmx, records, href_tmio, found in hits:
+                rep.write(f"{records:>4} — {name}\n")
+                rep.write(f"TMX : {href_tmx}\n")
+                rep.write(f"TMIO: {href_tmio}\n\n")
+
+        print(f"\n{len(hits)} map(s) où '{TRACKED_PLAYER}' apparaît.")
         print(f"Rapport enregistré dans '{output_file}' en {time.time() - start_time:.2f} sec.\n")
 
         ctx.close()

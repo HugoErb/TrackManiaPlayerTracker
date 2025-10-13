@@ -4,8 +4,8 @@ BASE_MAP_URL = "https://trackmania.exchange"
 MIN_RECORDS = 50
 MAX_RECORDS = 300
 
-SEEKED_PLAYER = "MissPlease"
+TRACKED_PLAYER = "MissPlease"
 
-INTERVAL_MONTH_NUMBER = 4
+INTERVAL_MONTH_NUMBER = 1
 
 FORBIDDEN_MAP_FILE_NAME = "forbidden_maps.txt"
