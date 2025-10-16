@@ -10,14 +10,13 @@ FORBIDDEN_MAP_FILE_NAME = "forbidden_maps.txt"
 
 # ───────────────────── Paramètres de la période de recherche ─────────────────
 
-# date de début fixe, format "YYYY-MM-DD". Si vide, elle sera
-# calculée à partir de l'intervalle (voir ci-dessous).
+# Date de début fixe, format "YYYY-MM-DD". Si vide -> calculée à partir de l'intervalle (voir ci-dessous).
 START_DATE = "2025-10-14"
 
-# date de fin fixe, format "YYYY-MM-DD". Si vide -> date du jour.
+# Date de fin fixe, format "YYYY-MM-DD". Si vide -> date du jour.
 END_DATE = "2025-10-14"
 
-#   Taille de l'intervalle à appliquer lorsque START_DATE n’est pas fournie.
+# Taille de l'intervalle en jour et en mois à appliquer lorsque START_DATE n’est pas fournie.
 INTERVAL_MONTHS = 0
 INTERVAL_DAYS = 1
 
