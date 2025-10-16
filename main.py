@@ -1,7 +1,7 @@
 import re
 import json
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from dateutil.relativedelta import relativedelta
@@ -119,15 +119,41 @@ def filter_maps_with_forbidden(maps):
         forbidden = {line.strip().casefold() for line in f if line.strip()}
     return [(n, h) for (n, h) in maps if n.strip().casefold() not in forbidden]
 
-def get_periode_quatre_mois():
-    aujourd_hui = date.today()
-    il_y_a_4_mois = aujourd_hui - relativedelta(months=INTERVAL_MONTH_NUMBER)
-    return f"{il_y_a_4_mois:%Y-%m-%d}...{aujourd_hui:%Y-%m-%d}"
+def get_periode() -> str:
+    """
+    Calcule une période 'YYYY-MM-DD...YYYY-MM-DD' selon les règles décrites ci-dessus.
+    """
+    today = date.today()
+    d_start = _parse_date_or_none(START_DATE)
+    d_end = _parse_date_or_none(END_DATE)
+
+    if d_start is None:
+        # START_DATE manquante -> on s'appuie sur END_DATE (ou today) et l'intervalle
+        if d_end is None:
+            d_end = today
+        d_start = d_end - relativedelta(months=INTERVAL_MONTHS, days=INTERVAL_DAYS)
+    else:
+        # START_DATE fournie -> END_DATE = fournie ou today par défaut
+        if d_end is None:
+            d_end = today
+
+    # Sécurité : s'assurer que début ≤ fin
+    if d_start > d_end:
+        d_start, d_end = d_end, d_start
+
+    return f"{d_start:%Y-%m-%d}...{d_end:%Y-%m-%d}"
+
+def _parse_date_or_none(s: str):
+    """Retourne une date si s est non vide et bien formatée (YYYY-MM-DD), sinon None."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    return datetime.strptime(s, "%Y-%m-%d").date()
 
 def find_player_on_tmio(page, tmio_url: str, player_name: str, max_load_more: int = 50) -> bool:
     """
-    Ouvre le leaderboard trackmania.io, clique 'Load more...' (avec tqdm),
-    puis scanne la liste des joueurs (avec tqdm) pour trouver player_name.
+    Ouvre le leaderboard trackmania.io, clique 'Load more...' jusqu'à ce qu'il n'y en ait plus
+    (ou jusqu'à max_load_more), puis scanne la liste des joueurs pour trouver player_name.
     Retourne True si trouvé.
     """
     rows_sel = "table.table.is-fullwidth.is-striped tbody tr"
@@ -137,9 +163,8 @@ def find_player_on_tmio(page, tmio_url: str, player_name: str, max_load_more: in
     page.wait_for_load_state("networkidle")
     page.wait_for_selector(rows_sel, timeout=30000)
 
-    # --- tqdm: chargement du leaderboard (Load more...)
+    # Charger le leaderboard (sans tqdm)
     prev = page.locator(rows_sel).count()
-    t_load = tqdm(total=0, desc="Load leaderboard", unit="rows", leave=False)
     for _ in range(max_load_more):
         btn = page.locator("button:has-text('Load more')").first
         if btn.count() == 0 or not btn.is_enabled():
@@ -149,35 +174,27 @@ def find_player_on_tmio(page, tmio_url: str, player_name: str, max_load_more: in
         page.wait_for_load_state("networkidle")
         try:
             page.wait_for_function(
-                """
-                (prev) => document.querySelectorAll('table.table.is-fullwidth.is-striped tbody tr').length > prev
-                """,
+                "(prev) => document.querySelectorAll('table.table.is-fullwidth.is-striped tbody tr').length > prev",
                 arg=rows_before,
                 timeout=15000
             )
         except Exception:
             break
         prev = page.locator(rows_sel).count()
-        t_load.update(max(0, prev - rows_before))
-    t_load.close()
 
-    # --- tqdm: scan des joueurs
+    # Scan des joueurs (sans tqdm)
+    target = player_name.strip().casefold()
     cells = page.locator(f"{rows_sel} td:nth-child(2)")
     n = cells.count()
-    target = player_name.strip().casefold()
-    t_scan = tqdm(total=n, desc="Scan joueurs", unit="joueur", leave=False)
     for i in range(n):
         try:
             txt = cells.nth(i).inner_text().strip()
             norm = " ".join(txt.split()).casefold()
             if target in norm:
-                t_scan.update(n - t_scan.n)
-                t_scan.close()
                 return True
         except Exception:
             pass
-        t_scan.update(1)
-    t_scan.close()
+
     return False
 
 def fetch_online_records(maps):
@@ -200,7 +217,7 @@ def fetch_online_records(maps):
 
     with path.open("a", encoding="utf-8") as forb:
         for idx, (name, href) in enumerate(
-            tqdm(maps, total=len(maps), desc="Lecture des Online records", unit="map"),
+            tqdm(maps, total=len(maps), desc=f"2eme filtre des maps + recherche de {TRACKED_PLAYER} ", unit="map"),
             start=1
         ):
             try:
@@ -269,16 +286,43 @@ if __name__ == '__main__':
 
     # Init
     start_time = time.time()
-    date_interval = get_periode_quatre_mois()
+    date_interval = get_periode()
     output_file = "reports/" + TRACKED_PLAYER + "_" + date_interval + ".txt"
     url = MAP_LIST_URL + date_interval
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context()
+        browser = p.chromium.launch(
+            headless=True,  # souvent nécessaire pour contourner Cloudflare / anti-bot
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        ctx = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 768},
+            locale="en-US",
+        )
+
+        # Petites astuces "stealth"
+        ctx.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+            """)
+
+        ctx.route("**/*", lambda route: route.continue_() if route.request.resource_type in (
+            "document", "xhr", "fetch", "script", "stylesheet")
+        else route.abort())
         page = ctx.new_page()
 
-        print(f"Récupération des maps en cours...")
+        print(f"Récupération des maps sur la période {date_interval.replace("..."," à ")}...")
         all_maps = get_maps(url)
         print(f"\n{len(all_maps)} maps trouvées en {time.time() - start_time:.2f} sec.")
         all_maps = filter_maps_with_forbidden(all_maps)
@@ -288,7 +332,6 @@ if __name__ == '__main__':
         eligible_maps = fetch_online_records(all_maps)
         print(f"\n{len(eligible_maps)} maps éligibles trouvées en {time.time() - start_time:.2f} sec.")
 
-        print(f"\nRecherche de {TRACKED_PLAYER} dans les maps récupérées en cours...")
         hits = [e for e in eligible_maps if e[-1] is True]
         with open(output_file, "a", encoding="utf-8") as rep:
             for name, href_tmx, records, href_tmio, found in hits:
