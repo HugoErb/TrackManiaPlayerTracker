@@ -62,9 +62,20 @@ if exist "requirements.txt" (
     echo [INFO] Aucun requirements.txt trouve a la racine. Etape ignoree.
 )
 
-REM ————— (Optionnel) Installer les navigateurs Playwright si la lib est presente —————
-REM Decommentez la ligne ci-dessous si vous utilisez Playwright :
-REM "%VENV_DIR%\Scripts\python.exe" -m playwright install chromium
+REM ————— Installation des navigateurs Playwright dans le venv —————
+echo Verification de la presence de la librairie 'playwright'...
+"%VENV_DIR%\Scripts\python.exe" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('playwright') else 1)"
+if errorlevel 1 (
+    echo [INFO] La librairie 'playwright' n'est pas installee dans le venv.
+    echo [INFO] Ajoutez 'playwright' a votre requirements.txt (ou installez-la manuellement) si vous souhaitez l'utiliser.
+) else (
+    echo Installation/maj des navigateurs Playwright...
+    "%VENV_DIR%\Scripts\python.exe" -m playwright install
+    if errorlevel 1 (
+        echo [ERREUR] Echec de 'playwright install'.
+        exit /b 1
+    )
+)
 
 echo.
 echo === Terminé ===
