@@ -12,10 +12,20 @@ import re
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 def _extract_int(text: str, default=None):
+    """
+    Extrait un entier uniquement si le texte ne contient que des chiffres
+    (espaces normaux, insécables et fines insécables supprimés).
+    Sinon, retourne `default` (None par défaut).
+    """
     if not text:
         return default
-    m = re.search(r"\d+", text.replace("\u202f","").replace("\xa0",""))
-    return int(m.group(0)) if m else default
+    # Supprime les espaces normaux, insécables (\xa0) et fines insécables (\u202f)
+    s = re.sub(r"[\s\u00a0\u202f]", "", text)
+    # Refuse tout ce qui n'est pas strictement numérique (ex: '52k' -> None)
+    if not s.isdigit():
+        return default
+    return int(s)
+
 
 def get_maps(url: str):
     items = []
