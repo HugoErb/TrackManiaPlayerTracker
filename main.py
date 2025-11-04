@@ -11,6 +11,22 @@ from constants import *
 import re
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+BLOCKED_RESOURCE_TYPES = {
+    "image", "font", "media", "websocket", "eventsource", "other"
+}
+
+BLOCKED_DOMAINS = [
+    "googletagmanager.com",
+    "google-analytics.com",
+    "doubleclick.net",
+    "facebook.net",
+    "cdn.onesignal.com",
+    "hotjar.com",
+    "segment.com",
+    "mixpanel.com",
+    "clarity.ms",
+]
+
 def _extract_int(text: str, default=None):
     """
     Extrait un entier uniquement si le texte ne contient que des chiffres
@@ -290,7 +306,12 @@ def fetch_online_records(maps):
 
     return eligible
 
-
+def should_block_request(req):
+    rt = req.resource_type
+    if rt in BLOCKED_RESOURCE_TYPES:
+        return True
+    url = req.url
+    return any(d in url for d in BLOCKED_DOMAINS)
 
 if __name__ == '__main__':
 
@@ -316,23 +337,27 @@ if __name__ == '__main__':
             ),
             viewport={"width": 1366, "height": 768},
             locale="en-US",
+            # service_workers="block",  # active si ta version Playwright le supporte
         )
 
         # Petites astuces "stealth"
         ctx.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-                Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
-            """)
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+            Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+        """)
 
-        ctx.route("**/*", lambda route: route.continue_() if route.request.resource_type in (
-            "document", "xhr", "fetch", "script", "stylesheet")
-        else route.abort())
+        # Bloquer images/polices/media/ws + domaines tracking
+        ctx.route("**/*", lambda route: route.abort() if should_block_request(route.request)
+                  else route.continue_())
+
         page = ctx.new_page()
+        page.set_default_timeout(10_000)             # 10 s pour les attentes DOM
+        page.set_default_navigation_timeout(15_000)  # 15 s pour les navigations
 
-        print(f"Récupération des maps sur la période {date_interval.replace("..."," à ")}...")
+        print(f"Récupération des maps sur la période {date_interval.replace('...',' à ')}...")
         all_maps = get_maps(url)
         print(f"\n{len(all_maps)} maps trouvées en {time.time() - start_time:.2f} sec.")
         all_maps = filter_maps_with_forbidden(all_maps)
@@ -354,3 +379,4 @@ if __name__ == '__main__':
 
         ctx.close()
         browser.close()
+

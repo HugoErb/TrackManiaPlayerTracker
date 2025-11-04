@@ -17,4 +17,8 @@ rem — Lancer main.py avec le Python du venv, en transmettant les arguments
 "%VENV_PY%" "main.py" %*
 set "RC=%ERRORLEVEL%"
 
+echo.
+echo Appuyez sur n'importe quel bouton pour fermer la fenetre...
+pause >nul
+
 endlocal & exit /b %RC%
