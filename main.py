@@ -27,6 +27,15 @@ BLOCKED_DOMAINS = [
     "clarity.ms",
 ]
 
+def dump_maps_list(maps, filepath, header=""):
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        if header:
+            f.write(header.strip() + "\n\n")
+        for name, href in maps:
+            f.write(f"{name}\n{href}\n\n")
+
+
 def _extract_int(text: str, default=None):
     """
     Extrait un entier uniquement si le texte ne contient que des chiffres
@@ -225,14 +234,14 @@ def find_player_on_tmio(page, tmio_url: str, player_name: str, max_load_more: in
 
 def fetch_online_records(maps):
     """
-    Pour chaque map:
-      - lit Online records sur TMX
-      - si > MAX_RECORDS -> ajoute le nom dans forbidden (sans doublon)
-      - si < MIN_RECORDS -> ignore
-      - sinon -> récupère le lien 'View more on trackmania.io', ouvre, charge tout, cherche TRACKED_PLAYER
-    Retourne: [(name, href_tmx, records, href_tmio, found_bool), ...]
+    Retourne:
+      eligible: [(name, href_tmx, records, href_tmio, found_bool), ...]
+      excluded_records: [(name, href_tmx, records, reason), ...]  # seulement MIN/MAX
+      excluded_other: [(name, href_tmx, reason, details), ...]    # no_records/no_tmio/timeouts...
     """
     eligible = []
+    excluded_records = []
+    excluded_other = []
 
     # Interdits existants (pour ne pas dupliquer)
     path = Path(FORBIDDEN_MAP_FILE_NAME)
@@ -242,14 +251,20 @@ def fetch_online_records(maps):
             existing_forbidden = {line.strip().casefold() for line in f if line.strip()}
 
     with path.open("a", encoding="utf-8") as forb:
-        for idx, (name, href) in enumerate(
-            tqdm(maps, total=len(maps), desc=f"2eme filtre des maps + recherche de {TRACKED_PLAYER} ", unit="map"),
-            start=1
+        for (name, href) in tqdm(
+            maps,
+            total=len(maps),
+            desc=f"2eme filtre des maps + recherche de {TRACKED_PLAYER} ",
+            unit="map"
         ):
             try:
                 page.goto(href, wait_until="load")
                 page.wait_for_load_state("networkidle")
             except PlaywrightTimeoutError:
+                excluded_other.append((name, href, "NAV_TIMEOUT_TMX", "Navigation timeout sur TMX"))
+                continue
+            except Exception as e:
+                excluded_other.append((name, href, "NAV_ERROR_TMX", repr(e)))
                 continue
 
             # Online records
@@ -266,45 +281,57 @@ def fetch_online_records(maps):
                     btn2 = page.get_by_role("button", name=re.compile(r"Online records", re.I)).first
                     if btn2.count() > 0:
                         records = _extract_int(btn2.inner_text())
-            except Exception:
-                pass
-
-            if records is None:
+            except Exception as e:
+                excluded_other.append((name, href, "RECORDS_PARSE_ERROR", repr(e)))
                 continue
 
-            # > MAX_RECORDS -> mettre dans forbidden (sans doublon)
+            if records is None:
+                excluded_other.append((name, href, "NO_RECORDS_FOUND", "Impossible de lire 'Online records'"))
+                continue
+
+            # > MAX_RECORDS -> forbidden + exclusion records
             if records > MAX_RECORDS:
                 key = name.strip().casefold()
                 if key not in existing_forbidden:
                     forb.write(f"{name}\n")
                     existing_forbidden.add(key)
+                excluded_records.append((name, href, records, f">{MAX_RECORDS}"))
                 continue
 
-            # < MIN_RECORDS -> ignorer
+            # < MIN_RECORDS -> exclusion records
             if records < MIN_RECORDS:
+                excluded_records.append((name, href, records, f"<{MIN_RECORDS}"))
                 continue
 
             # Éligible : récupérer le lien trackmania.io
-            tmio_url = None
+            tmio_url = ""
             try:
                 link = page.locator("a.btn.btn-link[href*='trackmania.io/#/leaderboard/']").first
                 if link.count() == 0:
                     link = page.locator("a.btn.btn-link:has-text('View more on trackmania.io')").first
                 if link.count() > 0:
-                    tmio_url = link.get_attribute("href")
-            except Exception:
-                tmio_url = None
+                    tmio_url = link.get_attribute("href") or ""
+            except Exception as e:
+                excluded_other.append((name, href, "TMIO_LINK_ERROR", repr(e)))
+                continue
+
+            if not tmio_url:
+                excluded_other.append((name, href, "NO_TMIO_LINK", f"records={records}"))
+                continue
 
             found = False
-            if tmio_url:
-                try:
-                    found = find_player_on_tmio(page, tmio_url, TRACKED_PLAYER, max_load_more=50)
-                except Exception:
-                    found = False
+            try:
+                found = find_player_on_tmio(page, tmio_url, TRACKED_PLAYER, max_load_more=50)
+            except PlaywrightTimeoutError:
+                excluded_other.append((name, href, "TMIO_TIMEOUT", f"records={records} | tmio={tmio_url}"))
+                continue
+            except Exception as e:
+                excluded_other.append((name, href, "TMIO_ERROR", f"{repr(e)} | tmio={tmio_url}"))
+                continue
 
-            eligible.append((name, href, records, tmio_url or "", found))
+            eligible.append((name, href, records, tmio_url, found))
 
-    return eligible
+    return eligible, excluded_records, excluded_other
 
 def should_block_request(req):
     rt = req.resource_type
@@ -315,15 +342,17 @@ def should_block_request(req):
 
 if __name__ == '__main__':
 
-    # Init
     start_time = time.time()
     date_interval = get_periode()
-    output_file = "reports/" + TRACKED_PLAYER + "_" + date_interval + ".txt"
     url = MAP_LIST_URL + date_interval
+
+    # Un seul report
+    final_report = f"reports/report_{date_interval}.txt"
+    Path("reports").mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True,  # souvent nécessaire pour contourner Cloudflare / anti-bot
+            headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -337,10 +366,8 @@ if __name__ == '__main__':
             ),
             viewport={"width": 1366, "height": 768},
             locale="en-US",
-            # service_workers="block",  # active si ta version Playwright le supporte
         )
 
-        # Petites astuces "stealth"
         ctx.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             window.chrome = { runtime: {} };
@@ -349,34 +376,106 @@ if __name__ == '__main__':
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
         """)
 
-        # Bloquer images/polices/media/ws + domaines tracking
         ctx.route("**/*", lambda route: route.abort() if should_block_request(route.request)
                   else route.continue_())
 
         page = ctx.new_page()
-        page.set_default_timeout(10_000)             # 10 s pour les attentes DOM
-        page.set_default_navigation_timeout(15_000)  # 15 s pour les navigations
+        page.set_default_timeout(10_000)
+        page.set_default_navigation_timeout(15_000)
 
         print(f"Récupération des maps sur la période {date_interval.replace('...',' à ')}...")
         all_maps = get_maps(url)
         print(f"\n{len(all_maps)} maps trouvées en {time.time() - start_time:.2f} sec.")
-        all_maps = filter_maps_with_forbidden(all_maps)
-        # all_maps = all_maps[:10]
-        print(f"Filtrage des maps effectué, {len(all_maps)} restante(s).\n")
 
-        eligible_maps = fetch_online_records(all_maps)
+        # -------- Filtre 1 : forbidden (blacklist)
+        all_maps_before = all_maps
+        maps_after_forbidden = filter_maps_with_forbidden(all_maps)
+
+        before_dict = {n.strip().casefold(): (n, h) for n, h in all_maps_before}
+        after_keys = {n.strip().casefold() for n, _ in maps_after_forbidden}
+        excluded_forbidden = [before_dict[k] for k in (before_dict.keys() - after_keys)]
+
+        print(f"Filtrage blacklist effectué, {len(maps_after_forbidden)} restante(s).\n")
+
+        # -------- Filtre 2 : records + recherche TMIO
+        eligible_maps, excluded_records, excluded_other = fetch_online_records(maps_after_forbidden)
+
         print(f"\n{len(eligible_maps)} maps éligibles trouvées en {time.time() - start_time:.2f} sec.")
+        print(f"Report unique écrit dans: {final_report}")
 
+        # -------- Hits (joueur trouvé)
         hits = [e for e in eligible_maps if e[-1] is True]
-        with open(output_file, "a", encoding="utf-8") as rep:
-            for name, href_tmx, records, href_tmio, found in hits:
-                rep.write(f"{records:>4} — {name}\n")
-                rep.write(f"TMX : {href_tmx}\n")
-                rep.write(f"TMIO: {href_tmio}\n\n")
 
-        print(f"\n{len(hits)} map(s) où '{TRACKED_PLAYER}' apparaît.")
-        print(f"Rapport enregistré dans '{output_file}' en {time.time() - start_time:.2f} sec.\n")
+        # -------- Ecriture du report unique
+        with open(final_report, "w", encoding="utf-8") as f:
+            f.write(f"Période: {date_interval}\n")
+            f.write(f"TRACKED_PLAYER: {TRACKED_PLAYER}\n")
+            f.write(f"MIN_RECORDS={MIN_RECORDS} | MAX_RECORDS={MAX_RECORDS}\n")
+            f.write(f"Temps total: {time.time() - start_time:.2f} sec.\n")
+            f.write("\n" + "="*80 + "\n")
+            f.write("1) MAPS TROUVÉES SUR LA PÉRIODE (avant filtres)\n")
+            f.write("="*80 + "\n\n")
+            for name, href in all_maps:
+                f.write(f"{name}\n{href}\n\n")
+
+            f.write("\n" + "="*80 + "\n")
+            f.write("2) MAPS EXCLUES (blacklist / forbidden)\n")
+            f.write("="*80 + "\n\n")
+            if excluded_forbidden:
+                for name, href in excluded_forbidden:
+                    f.write(f"{name}\n{href}\nREASON: FORBIDDEN_LIST\n\n")
+            else:
+                f.write("Aucune\n\n")
+
+            f.write("\n" + "="*80 + "\n")
+            f.write("3) MAPS EXCLUES (online records hors plage)\n")
+            f.write("="*80 + "\n\n")
+            if excluded_records:
+                # tri pour lecture
+                for name, href, records, why in sorted(excluded_records, key=lambda x: (x[3], x[2])):
+                    f.write(f"{name}\n")
+                    f.write(f"{records} records\n")
+                    f.write(f"{href}\n")
+                    f.write(f"REASON: RECORDS_{why} (MIN={MIN_RECORDS}, MAX={MAX_RECORDS})\n\n")
+            else:
+                f.write("Aucune\n\n")
+
+            f.write("\n" + "="*80 + "\n")
+            f.write("4) MAPS ÉLIGIBLES À LA RECHERCHE FINALE (records OK + lien TMIO)\n")
+            f.write("="*80 + "\n\n")
+            if eligible_maps:
+                for name, href_tmx, records, href_tmio, found in eligible_maps:
+                    f.write(f"{name}\n")
+                    f.write(f"{records} records\n")
+                    f.write(f"TMX : {href_tmx}\n")
+                    f.write(f"TMIO: {href_tmio}\n")
+                    f.write(f"FOUND({TRACKED_PLAYER}): {found}\n\n")
+            else:
+                f.write("Aucune\n\n")
+
+            # Optionnel mais très utile : les exclusions techniques (no_records/no_tmio/timeouts)
+            f.write("\n" + "="*80 + "\n")
+            f.write("5) EXCLUSIONS TECHNIQUES\n")
+            f.write("="*80 + "\n\n")
+            if excluded_other:
+                for name, href, reason, details in excluded_other:
+                    f.write(f"{name}\n{href}\nREASON: {reason}\nDETAILS: {details}\n\n")
+            else:
+                f.write("Aucune\n\n")
+
+            f.write("\n" + "="*80 + "\n")
+            f.write("6) RÉSULTATS (maps où le joueur est trouvé)\n")
+            f.write("="*80 + "\n\n")
+            if hits:
+                for name, href_tmx, records, href_tmio, found in hits:
+                    f.write(f"{name}\n")
+                    f.write(f"{records} records\n")
+                    f.write(f"TMX : {href_tmx}\n")
+                    f.write(f"TMIO: {href_tmio}\n\n")
+            else:
+                f.write("Aucune\n\n")
 
         ctx.close()
         browser.close()
+
 
